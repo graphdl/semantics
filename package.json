@@ -1,0 +1,42 @@
+{
+  "name": "@graphdl/semantics",
+  "version": "0.1.0",
+  "description": "GraphDL semantic parser for converting natural language to graph notation",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest --coverage"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/graphdl/semantics.git"
+  },
+  "keywords": [
+    "graphdl",
+    "semantics",
+    "parser",
+    "nlp",
+    "graph"
+  ],
+  "author": "GraphDL",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "@vitest/ui": "^2.1.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.9"
+  }
+}

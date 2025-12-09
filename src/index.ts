@@ -1,2 +1,2 @@
-export { GraphDLParser } from './parser'
-export type { ParsedStatement, Lexicon } from './parser'
+export { GraphDLParser } from './parser.js'
+export type { ParsedStatement, Lexicon } from './parser.js'

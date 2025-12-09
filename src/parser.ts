@@ -1,7 +1,7 @@
-import { VERB_INDEX, VerbEntry as GeneratedVerbEntry } from './generated/verbs'
-import { CONCEPT_INDEX, ConceptEntry as GeneratedConceptEntry } from './generated/concepts'
-import { PREPOSITIONS } from './generated/prepositions'
-import { CONJUNCTIONS, ConjunctionEntry as GeneratedConjunctionEntry } from './generated/conjunctions'
+import { VERB_INDEX, VerbEntry as GeneratedVerbEntry } from './generated/verbs.js'
+import { CONCEPT_INDEX, ConceptEntry as GeneratedConceptEntry } from './generated/concepts.js'
+import { PREPOSITIONS } from './generated/prepositions.js'
+import { CONJUNCTIONS, ConjunctionEntry as GeneratedConjunctionEntry } from './generated/conjunctions.js'
 import fs from 'fs'
 
 // ============================================================================
@@ -342,10 +342,30 @@ export class StatementParser {
       const [, verbList, conj, lastVerb, rest] = oxfordCommaMatch
       const verbs = verbList.split(/,\s*/).concat([lastVerb])
 
-      // Check if all are verbs
-      const allVerbs = verbs.every(v => this.lexicon.verbs.has(v.toLowerCase()))
+      // Check if first word is a verb (imperative sentences start with verb)
+      // Don't require ALL to be verbs (some may be missing from lexicon)
+      const firstIsVerb = this.lexicon.verbs.has(verbs[0].toLowerCase())
+      // Also check that the "rest" doesn't start with a verb (which would indicate wrong split)
+      const restWords = rest.trim().split(/\s+/)
+      const restStartsWithVerb = restWords.length > 0 && this.lexicon.verbs.has(restWords[0].toLowerCase())
 
-      if (allVerbs && verbs.length >= 3) {
+      if (firstIsVerb && !restStartsWithVerb && verbs.length >= 3) {
+        // Recursively expand the rest if it has "such as" or other patterns
+        let allExpansions: ParsedStatement[] = []
+        for (const verb of verbs) {
+          const verbText = `${this.capitalize(verb)} ${rest}`
+          const needsExpansion = /\bsuch as\b/i.test(rest) || /\b(and|or)\b/i.test(rest) || rest.includes(',')
+          if (needsExpansion) {
+            const subExpansions = this.expandRawText(verbText)
+            if (subExpansions.length > 1) {
+              allExpansions.push(...subExpansions.map(exp => this.parseSingle(exp)))
+            } else {
+              allExpansions.push(this.parseSingle(verbText))
+            }
+          } else {
+            allExpansions.push(this.parseSingle(verbText))
+          }
+        }
         return {
           original: text,
           predicate: this.capitalize(verbs[0]),
@@ -354,7 +374,7 @@ export class StatementParser {
           confidence: 1,
           unknownWords: [],
           hasConjunction: true,
-          expansions: verbs.map(verb => this.parseSingle(`${this.capitalize(verb)} ${rest}`)),
+          expansions: allExpansions,
         }
       }
     }
@@ -394,8 +414,8 @@ export class StatementParser {
 
     // Check for noun conjunctions in raw text before parsing
     // This allows us to expand BEFORE concept normalization
-    // Also check for commas and slashes which indicate lists to expand
-    const hasExpandablePattern = /\b(and|or)\b/i.test(text) || text.includes(',') || text.includes('/')
+    // Also check for commas, slashes, and "such as" which indicate lists to expand
+    const hasExpandablePattern = /\b(and|or)\b/i.test(text) || text.includes(',') || text.includes('/') || /\bsuch as\b/i.test(text)
     if (hasExpandablePattern && !this.isVerbConjunction(text)) {
       const expansions = this.expandRawText(text)
       if (expansions.length > 1) {
@@ -527,14 +547,59 @@ export class StatementParser {
       }
     }
 
+    // Pattern: "Verb X such as A, B, and C" → ["Verb A", "Verb B", "Verb C"]
+    // Example: "Survey features such as highway alignments, property boundaries, utilities"
+    //       → ["Survey highway alignments", "Survey property boundaries", "Survey utilities"]
+    const suchAsMatch = text.match(/^(\w+)\s+(.+?)\s+such\s+as\s+(.+)$/i)
+    if (suchAsMatch) {
+      const [, verb, category, examples] = suchAsMatch
+      if (this.lexicon.verbs.has(verb.toLowerCase())) {
+        // Expand the examples list
+        const expandedExamples = this.expandSuchAs(`${category} such as ${examples}`)
+        if (expandedExamples.length > 1) {
+          return expandedExamples.map(ex => `${verb} ${ex}`)
+        }
+      }
+    }
+
     return [text]
   }
 
   /**
-   * Check if a phrase needs expansion (has conjunctions, commas, or slashes)
+   * Check if a phrase needs expansion (has conjunctions, commas, slashes, or "such as")
    */
   private needsExpansion(phrase: string): boolean {
-    return /\b(and|or)\b/i.test(phrase) || phrase.includes(',') || phrase.includes('/')
+    return /\b(and|or)\b/i.test(phrase) || phrase.includes(',') || phrase.includes('/') || /\bsuch as\b/i.test(phrase)
+  }
+
+  /**
+   * Expand "such as" patterns - extract BOTH the category and examples
+   * Example: "features such as highway alignments, property boundaries, utilities"
+   *       → ["features", "highway alignments", "property boundaries", "utilities"]
+   * Example: "publications such as brochures"
+   *       → ["publications", "brochures"]
+   * This creates tasks for both the general category and specific examples
+   */
+  private expandSuchAs(phrase: string): string[] {
+    const match = phrase.match(/^(.+?)\s+such\s+as\s+(.+)$/i)
+    if (!match) return [phrase]
+
+    const [, prefix, examples] = match
+
+    // Clean up the prefix (remove trailing comma if present)
+    const cleanPrefix = prefix.replace(/,\s*$/, '').trim()
+
+    // Split the examples on commas and "and"/"or"
+    let parts = examples.split(/\s*,\s*(?:and\s+|or\s+)?|\s+and\s+|\s+or\s+/i)
+      .map(p => p.trim())
+      .filter(p => p.length > 0)
+
+    // Return both the category (prefix) and the examples
+    if (parts.length >= 1 && cleanPrefix) {
+      return [cleanPrefix, ...parts]
+    }
+
+    return [phrase]
   }
 
   private expandConjunctions(parsed: ParsedStatement): ParsedStatement[] {
@@ -733,6 +798,18 @@ export class StatementParser {
    */
   private expandPhrase(phrase: string): string[] {
     if (!phrase) return [phrase]
+
+    // Check for "such as" pattern first - extract examples
+    // Example: "features such as highway alignments, property boundaries, utilities"
+    //       → ["highway alignments", "property boundaries", "utilities"]
+    // Example: "publications such as brochures" → ["brochures"]
+    if (/\bsuch\s+as\b/i.test(phrase)) {
+      const suchAsExpanded = this.expandSuchAs(phrase)
+      // If we got different results than the original, use them (even if just 1)
+      if (suchAsExpanded.length >= 1 && (suchAsExpanded.length > 1 || suchAsExpanded[0] !== phrase)) {
+        return suchAsExpanded.flatMap(p => this.expandPhrase(p))
+      }
+    }
 
     // Check for slash pattern with shared prefix/suffix
     // Examples:
@@ -1015,11 +1092,12 @@ export class GraphDLParser {
   /**
    * Convert a phrase to PascalCase
    * Handles hyphenated compounds and multi-word phrases
+   * Strips commas, periods, and other punctuation
    */
   private toPascalCase(phrase: string): string {
-    const words = phrase.split(/\s+/).filter(w =>
-      w && !['and', 'or', 'but', 'the', 'a', 'an'].includes(w.toLowerCase())
-    )
+    const words = phrase.split(/\s+/)
+      .map(w => w.replace(/[,;:()]/g, '')) // Strip punctuation
+      .filter(w => w && !['and', 'or', 'but', 'the', 'a', 'an'].includes(w.toLowerCase()))
 
     return words
       .map(word => {
@@ -1069,18 +1147,8 @@ export class GraphDLParser {
 
         parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
       } else {
-        // No internal preposition - convert all to PascalCase
-        const filteredWords = words.filter(w => !['and', 'or', 'but'].includes(w.toLowerCase()))
-        const pascalCase = filteredWords
-          .map(word => {
-            // Handle hyphenated compounds: "cross-functional" -> "CrossFunctional"
-            return word.split('-')
-              .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-              .join('')
-          })
-          .join('')
-
-        parts.push(pascalCase)
+        // No internal preposition - convert all to PascalCase using helper
+        parts.push(this.toPascalCase(objectPhrase))
       }
     }
     if (parse.preposition) parts.push(parse.preposition)
@@ -1120,17 +1188,8 @@ export class GraphDLParser {
 
           parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
         } else {
-          // Convert to PascalCase, preserving hyphens as compound words
-          const pascalCase = words
-            .map(word => {
-              // Handle hyphenated compounds: "cross-channel" -> "CrossChannel"
-              return word.split('-')
-                .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-                .join('')
-            })
-            .join('')
-
-          parts.push(pascalCase)
+          // Convert to PascalCase using helper (strips commas and other punctuation)
+          parts.push(this.toPascalCase(parse.complement))
         }
       }
     }

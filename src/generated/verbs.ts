@@ -13396,6 +13396,18 @@ export const VERBS: VerbEntry[] = [
     "inverse": "",
     "source": "generated",
     "vocabulary": "general"
+  },
+  {
+    "canonicalForm": "retrace",
+    "description": "Redraw or go back over lines or paths previously drawn or traveled",
+    "predicate": "retraces",
+    "event": "retraced",
+    "activity": "retracing",
+    "actor": "Retracer",
+    "object": "Retrace",
+    "inverse": "retracedBy",
+    "source": "ONET",
+    "vocabulary": "general"
   }
 ]
 

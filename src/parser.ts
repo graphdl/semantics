@@ -1022,7 +1022,6 @@ export class GraphDLParser {
     )
 
     return words
-      .slice(0, 3) // Limit to 3 words
       .map(word => {
         // Handle hyphenated compounds: "cross-functional" -> "CrossFunctional"
         return word.split('-')
@@ -1045,38 +1044,44 @@ export class GraphDLParser {
     if (parse.subject) parts.push(parse.subject)
     if (parse.predicate) parts.push(parse.predicate)
     if (parse.object) {
-      // For objects, preserve meaningful noun phrases
+      // For objects, preserve ALL words - no truncation
       // Handle hyphenated compounds: "cross-functional strategies" -> "CrossFunctionalStrategies"
-      // Handle multiple nouns: "roles mapping" -> "RolesMapping"
-      // But truncate at prepositions: "quality of customer" -> "Quality"
+      // Handle prepositions by inserting dots: "quality of customer" -> "Quality.of.Customer"
 
-      let objectPhrase = parse.object
+      const objectPhrase = parse.object
 
-      // If there's a preposition, take only the part before it
-      const prepMatch = objectPhrase.match(/^(.+?)\s+(of|in|on|at|to|for|with|from|by)\s+/)
-      if (prepMatch) {
-        objectPhrase = prepMatch[1]
-      }
+      // Split into words
+      const words = objectPhrase.split(/\s+/).filter(w => w)
 
-      // Split into words and filter out conjunctions
-      const words = objectPhrase.split(/\s+/).filter(w =>
-        w && !['and', 'or', 'but'].includes(w.toLowerCase())
+      // Check for preposition in object (e.g., "quality of customer")
+      const prepIndex = words.findIndex(w =>
+        ['of', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by'].includes(w.toLowerCase())
       )
 
-      // Take up to the first 3 meaningful words to avoid overly long identifiers
-      const significantWords = words.slice(0, 3)
+      if (prepIndex > 0 && prepIndex < words.length - 1) {
+        // Split at preposition: "quality of customer" -> "Quality.of.Customer"
+        const beforePrep = words.slice(0, prepIndex).filter(w => !['and', 'or', 'but'].includes(w.toLowerCase()))
+        const prep = words[prepIndex]
+        const afterPrep = words.slice(prepIndex + 1).filter(w => !['and', 'or', 'but'].includes(w.toLowerCase()))
 
-      // Convert to PascalCase, preserving hyphens as compound words
-      const pascalCase = significantWords
-        .map(word => {
-          // Handle hyphenated compounds: "cross-functional" -> "CrossFunctional"
-          return word.split('-')
-            .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-            .join('')
-        })
-        .join('')
+        const beforePascal = this.toPascalCase(beforePrep.join(' '))
+        const afterPascal = this.toPascalCase(afterPrep.join(' '))
 
-      parts.push(pascalCase)
+        parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
+      } else {
+        // No internal preposition - convert all to PascalCase
+        const filteredWords = words.filter(w => !['and', 'or', 'but'].includes(w.toLowerCase()))
+        const pascalCase = filteredWords
+          .map(word => {
+            // Handle hyphenated compounds: "cross-functional" -> "CrossFunctional"
+            return word.split('-')
+              .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+              .join('')
+          })
+          .join('')
+
+        parts.push(pascalCase)
+      }
     }
     if (parse.preposition) parts.push(parse.preposition)
     if (parse.complement) {
@@ -1111,15 +1116,12 @@ export class GraphDLParser {
           const afterPrep = words.slice(prepIndex + 1)
 
           const beforePascal = this.toPascalCase(beforePrep.join(' '))
-          const afterPascal = this.toPascalCase(afterPrep.slice(0, 2).join(' ')) // Limit after prep
+          const afterPascal = this.toPascalCase(afterPrep.join(' '))
 
           parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
         } else {
-          // Take up to the first 3 meaningful words
-          const significantWords = words.slice(0, 3)
-
           // Convert to PascalCase, preserving hyphens as compound words
-          const pascalCase = significantWords
+          const pascalCase = words
             .map(word => {
               // Handle hyphenated compounds: "cross-channel" -> "CrossChannel"
               return word.split('-')

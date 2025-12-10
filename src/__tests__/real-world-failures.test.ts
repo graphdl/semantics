@@ -79,14 +79,21 @@ describe('Real World Failure Cases', () => {
     const result = parser.parse('Direct, plan, or implement policies, objectives, or activities')
     console.log('Complex nested:', JSON.stringify(result, null, 2))
 
-    // Currently expands verbs: direct, plan, implement = 3 expansions
-    // TODO: Ideally should also expand objects: policies, objectives, activities
-    // for a total of 3 verbs × 3 objects = 9 expansions
+    // Should expand to 3 verbs × 3 objects = 9 expansions (full cartesian product)
     expect(result.expansions).toBeDefined()
-    expect(result.expansions.length).toBeGreaterThanOrEqual(3)
-    expect(result.expansions[0].predicate.toLowerCase()).toBe('direct')
-    expect(result.expansions[1].predicate.toLowerCase()).toBe('plan')
-    expect(result.expansions[2].predicate.toLowerCase()).toBe('implement')
+    expect(result.expansions!.length).toBe(9)
+
+    // Verify we have all three verbs represented
+    const predicates = result.expansions!.map(e => e.predicate?.toLowerCase())
+    expect(predicates.filter(p => p === 'direct')).toHaveLength(3)
+    expect(predicates.filter(p => p === 'plan')).toHaveLength(3)
+    expect(predicates.filter(p => p === 'implement')).toHaveLength(3)
+
+    // Verify we have all three objects represented
+    const objects = result.expansions!.map(e => e.object?.toLowerCase())
+    expect(objects.filter(o => o === 'policies')).toHaveLength(3)
+    expect(objects.filter(o => o === 'objectives')).toHaveLength(3)
+    expect(objects.filter(o => o === 'activities')).toHaveLength(3)
   })
 
   test('ONET: such as examples should be separate expansions', () => {

@@ -169,7 +169,8 @@ export class POSTagger {
   constructor(private lexicon: Lexicon) {}
 
   tag(tokens: Token[]): Token[] {
-    return tokens.map(token => {
+    // First pass: assign POS based on lexicon
+    const tagged = tokens.map(token => {
       const norm = token.normalized
 
       // Check each part of speech
@@ -201,6 +202,37 @@ export class POSTagger {
 
       return token
     })
+
+    // Second pass: contextual disambiguation
+    // Words ending in -ing that are followed by a noun are likely noun modifiers, not verbs
+    // e.g., "building design" - "building" is a noun modifier, not a verb
+    for (let i = 0; i < tagged.length - 1; i++) {
+      const current = tagged[i]
+      const next = tagged[i + 1]
+
+      // If current is tagged as VERB and ends in -ing, check context
+      if (current.pos === 'VERB' && current.normalized.endsWith('ing')) {
+        // If followed by a noun (or something that looks like a noun), re-tag as NOUN
+        // Common gerunds used as nouns: building, planning, manufacturing, shipping, etc.
+        if (next.pos === 'NOUN' || next.pos === 'UNK' ||
+            (next.pos === 'VERB' && !next.normalized.endsWith('ing')) ||
+            next.text.match(/^[A-Z]/)) {
+          current.pos = 'NOUN'
+        }
+      }
+    }
+
+    // Also check: if -ing word is the LAST word, it's likely a noun (no object follows)
+    if (tagged.length > 0) {
+      const last = tagged[tagged.length - 1]
+      if (last.pos === 'VERB' && last.normalized.endsWith('ing')) {
+        // Re-check if this is actually a gerund used as noun
+        // In imperative sentences, verbs have objects, so a trailing -ing is often a noun
+        last.pos = 'NOUN'
+      }
+    }
+
+    return tagged
   }
 }
 
@@ -502,31 +534,78 @@ export class StatementParser {
     }
 
     // Pattern: "Verb X or Y Z" where Z is shared suffix (only when no preposition)
+    // BUT: Don't match when middle is a hyphenated modifier (like "long-term vision")
+    // because that's a compound noun phrase, not a shared suffix pattern
     const verbWithSharedSuffix = text.match(/^(\w+)\s+(.+?)\s+(and|or)\s+([^\s]+)\s+(.+)$/i)
     if (verbWithSharedSuffix) {
       const [, verb, left, conj, middle, suffix] = verbWithSharedSuffix
       if (this.lexicon.verbs.has(verb.toLowerCase())) {
-        // Recursively expand left and middle
-        const leftExpanded = this.expandPhrase(left)
-        const middleExpanded = this.expandPhrase(middle)
+        // Check if middle+suffix forms a known concept (don't split compound noun phrases)
+        const middleSuffixPhrase = `${middle} ${suffix}`.toLowerCase().replace(/-/g, ' ')
+        const middleSuffixJoined = `${middle}${suffix}`.toLowerCase().replace(/-/g, '')
+        const isCompoundConcept = this.lexicon.concepts.has(middleSuffixPhrase) ||
+                                  this.lexicon.concepts.has(middleSuffixJoined) ||
+                                  this.lexicon.concepts.has(`${middle}-${suffix}`.toLowerCase())
 
-        // Recursively expand the suffix as well (for nested conjunctions)
-        const results = [
-          ...leftExpanded.map(l => `${verb} ${l} ${suffix}`),
-          ...middleExpanded.map(m => `${verb} ${m} ${suffix}`)
-        ]
+        // Also check if middle is a typical modifier (hyphenated or adjective-like)
+        const isMiddleModifier = middle.includes('-') ||
+                                 middle.toLowerCase().endsWith('term') ||
+                                 middle.toLowerCase().endsWith('time') ||
+                                 middle.toLowerCase().endsWith('level')
 
-        // If suffix has conjunctions, expand each result
-        if (this.needsExpansion(suffix)) {
-          const expandedResults: string[] = []
-          for (const result of results) {
-            const subExpansions = this.expandRawText(result)
-            expandedResults.push(...subExpansions)
+        // Also check if "middle suffix" forms a compound phrase that should stay together
+        const isCompoundPhraseMatch = this.isCompoundPhrase(middle, suffix)
+
+        // If middle is a verb AND left is NOT a single verb, this is likely a mixed pattern
+        // e.g., "department heads and assign or delegate responsibilities"
+        //   left="department heads" (noun phrase), middle="assign" (verb) → skip shared suffix
+        // But: "assign or delegate responsibilities"
+        //   left="assign" (verb), middle="delegate" (verb) → USE shared suffix
+        const isMiddleVerb = this.lexicon.verbs.has(middle.toLowerCase())
+        const leftWords = left.trim().split(/\s+/)
+        const leftLastWord = leftWords[leftWords.length - 1]?.toLowerCase() || ''
+        const isLeftVerb = leftWords.length === 1 && this.lexicon.verbs.has(leftLastWord)
+
+        // Skip shared suffix only if middle is a verb but left is NOT a verb
+        const skipDueToVerbMismatch = isMiddleVerb && !isLeftVerb
+
+        if (isCompoundConcept || isMiddleModifier || isCompoundPhraseMatch || skipDueToVerbMismatch) {
+          // Don't use shared suffix pattern - fall through to simple conjunction
+        } else {
+          // Recursively expand left and middle
+          const leftExpanded = this.expandPhrase(left)
+          const middleExpanded = this.expandPhrase(middle)
+
+          // Don't add suffix if left already ends with it (avoid "demand forecast forecast")
+          const suffixLower = suffix.toLowerCase()
+          const results: string[] = []
+
+          for (const l of leftExpanded) {
+            const lWords = l.trim().split(/\s+/)
+            const lastWord = lWords[lWords.length - 1]?.toLowerCase()
+            if (lastWord === suffixLower) {
+              results.push(`${verb} ${l}`)
+            } else {
+              results.push(`${verb} ${l} ${suffix}`)
+            }
           }
-          return expandedResults
-        }
 
-        return results
+          for (const m of middleExpanded) {
+            results.push(`${verb} ${m} ${suffix}`)
+          }
+
+          // If suffix has conjunctions, expand each result
+          if (this.needsExpansion(suffix)) {
+            const expandedResults: string[] = []
+            for (const result of results) {
+              const subExpansions = this.expandRawText(result)
+              expandedResults.push(...subExpansions)
+            }
+            return expandedResults
+          }
+
+          return results
+        }
       }
     }
 
@@ -733,6 +812,48 @@ export class StatementParser {
   }
 
   /**
+   * Check if "middle suffix" forms a compound phrase that should stay together
+   * Examples of compound phrases: "record keeping", "policy changes", "cost reduction"
+   * These should NOT be treated as shared suffix patterns
+   */
+  private isCompoundPhrase(middle: string, suffix: string): boolean {
+    const middleLower = middle.toLowerCase()
+    const suffixLower = suffix.toLowerCase()
+
+    // Known compound phrases that should stay together
+    const compoundPhrases = new Set([
+      'record keeping', 'record-keeping', 'policy changes', 'cost reduction',
+      'quality control', 'data management', 'risk management', 'project management',
+      'change management', 'time management', 'resource allocation', 'budget allocation',
+      'staff development', 'team building', 'problem solving', 'decision making',
+      'policy making', 'rule making', 'law enforcement', 'code enforcement',
+    ])
+
+    const combined = `${middleLower} ${suffixLower}`
+    if (compoundPhrases.has(combined)) {
+      return true
+    }
+
+    // Heuristic: if middle is a noun and suffix ends in -ing (gerund), likely a compound
+    // e.g., "record keeping", "problem solving", "decision making"
+    if (/ing$/i.test(suffix) && !/^(assign|implement|develop|manage|create|ensure)$/i.test(middle)) {
+      // Check if middle looks like a noun (not a verb)
+      const verbPatterns = /^(assign|delegate|implement|develop|manage|create|ensure|maintain|review|approve|coordinate|direct|evaluate|identify|analyze|perform|conduct|establish|prepare|provide|support|monitor|report|document|communicate|facilitate|generate|produce|process|recommend|select|determine|define|design|plan|organize|lead|guide|handle|negotiate|resolve|validate|verify|test|train|assess|measure|inspect|investigate|research|execute|deliver)$/i
+      if (!verbPatterns.test(middle)) {
+        return true
+      }
+    }
+
+    // Heuristic: if middle is a noun and suffix is "changes", "reduction", "allocation", etc.
+    const businessSuffixes = /^(changes|reduction|allocation|management|development|building|solving|making|enforcement|control|planning|analysis|assessment|evaluation|implementation)$/i
+    if (businessSuffixes.test(suffix) && !/^(assign|implement|develop|manage|create|ensure)$/i.test(middle)) {
+      return true
+    }
+
+    return false
+  }
+
+  /**
    * Expand slash patterns with shared prefix/suffix detection
    * Examples:
    * - "existing products/services" → ["existing products", "existing services"]
@@ -863,19 +984,72 @@ export class StatementParser {
       return [phrase]
     }
 
+    // Handle "both X and Y" pattern - strip "both" and expand normally
+    // Example: "both enterprise and customer" → ["enterprise", "customer"]
+    if (/^both\s+/i.test(phrase)) {
+      const withoutBoth = phrase.replace(/^both\s+/i, '')
+      return this.expandPhrase(withoutBoth)
+    }
+
     // Pattern: "X or Y something" where "something" is shared
     // Example: "generation or mechanical equipment" → ["generation equipment", "mechanical equipment"]
+    // BUT: Don't match when middle is a determiner (the, a, an) - that's likely "X and the Y"
+    // Also: Don't add suffix if left already ends with the suffix (avoid "demand forecast forecast")
+    // Also: Don't match if "middle + suffix" forms a common compound phrase
     const sharedSuffixMatch = phrase.match(/^(.+?)\s+(and|or)\s+([^\s]+)\s+(.+)$/i)
     if (sharedSuffixMatch) {
       const [, left, conj, middle, suffix] = sharedSuffixMatch
-      // Recursively expand left side and middle
-      const leftExpanded = this.expandPhrase(left)
-      const middleExpanded = this.expandPhrase(middle)
+      const middleLower = middle.toLowerCase()
 
-      return [
-        ...leftExpanded.map(l => `${l} ${suffix}`),
-        ...middleExpanded.map(m => `${m} ${suffix}`)
-      ]
+      // If middle is a determiner, this is not a shared suffix pattern
+      // e.g., "enterprise and the customer" is NOT "enterprise customer" and "the customer"
+      if (['the', 'a', 'an', 'this', 'that', 'these', 'those'].includes(middleLower)) {
+        // Skip to simple split
+      }
+      // Check if "middle suffix" forms a common compound phrase that should stay together
+      // Common patterns: "record keeping", "policy changes", "cost reduction", "quality control"
+      // Heuristic: if suffix is a gerund (ing) or plural noun, and middle+suffix makes sense together
+      else if (this.isCompoundPhrase(middle, suffix)) {
+        // Skip to simple split - don't treat as shared suffix
+      }
+      // If middle is a verb AND left is NOT a single verb, skip shared suffix
+      // e.g., "department heads and assign or delegate responsibilities"
+      //   left="department heads" (noun phrase), middle="assign" (verb) → skip
+      // But: "assign or delegate responsibilities" (both verbs) → use shared suffix
+      else {
+        const leftWords = left.trim().split(/\s+/)
+        const leftLastWord = leftWords[leftWords.length - 1]?.toLowerCase() || ''
+        const isLeftVerb = leftWords.length === 1 && this.lexicon.verbs.has(leftLastWord)
+        const isMiddleVerb = this.lexicon.verbs.has(middleLower)
+        if (isMiddleVerb && !isLeftVerb) {
+          // Skip to simple split - mixed verb/noun pattern
+        } else {
+        // Recursively expand left side and middle
+        const leftExpanded = this.expandPhrase(left)
+        const middleExpanded = this.expandPhrase(middle)
+
+        // Don't add suffix if left already ends with it
+        const suffixLower = suffix.toLowerCase()
+        const results: string[] = []
+
+        for (const l of leftExpanded) {
+          const lWords = l.trim().split(/\s+/)
+          const lastWord = lWords[lWords.length - 1]?.toLowerCase()
+          if (lastWord === suffixLower) {
+            // Left already has the suffix, don't duplicate
+            results.push(l)
+          } else {
+            results.push(`${l} ${suffix}`)
+          }
+        }
+
+        for (const m of middleExpanded) {
+          results.push(`${m} ${suffix}`)
+        }
+
+        return results
+        }
+      }
     }
 
     // Pattern: "X or Y" (no shared suffix)
@@ -1096,7 +1270,7 @@ export class GraphDLParser {
    */
   private toPascalCase(phrase: string): string {
     const words = phrase.split(/\s+/)
-      .map(w => w.replace(/[,;:()]/g, '')) // Strip punctuation
+      .map(w => w.replace(/[,;:()']/g, '')) // Strip punctuation including apostrophes
       .filter(w => w && !['and', 'or', 'but', 'the', 'a', 'an'].includes(w.toLowerCase()))
 
     return words
@@ -1119,8 +1293,9 @@ export class GraphDLParser {
 
     const parts: string[] = []
 
-    if (parse.subject) parts.push(parse.subject)
-    if (parse.predicate) parts.push(parse.predicate)
+    if (parse.subject) parts.push(this.toPascalCase(parse.subject))
+    // Predicate (verb) should be camelCase (lowercase)
+    if (parse.predicate) parts.push(parse.predicate.toLowerCase())
     if (parse.object) {
       // For objects, preserve ALL words - no truncation
       // Handle hyphenated compounds: "cross-functional strategies" -> "CrossFunctionalStrategies"
@@ -1153,43 +1328,137 @@ export class GraphDLParser {
     }
     if (parse.preposition) parts.push(parse.preposition)
     if (parse.complement) {
-      // Check if complement contains an internal prepositional phrase
-      // Pattern: "X <verb> <prep> Y" like "businesses concerned with production"
-      // Should become: Businesses.concerned.with.Production
-      const internalPrepMatch = parse.complement.match(
-        /^(.+?)\s+(concerned|related|involved|responsible|engaged|associated|dealing|focused|pertaining)\s+(with|to|in|for|on)\s+(.+)$/i
-      )
-
-      if (internalPrepMatch) {
-        const [, subject, verb, prep, object] = internalPrepMatch
-        // Format: Subject.verb.prep.Object
-        const subjectPascal = this.toPascalCase(subject)
-        const objectPascal = this.toPascalCase(object)
-        parts.push(`${subjectPascal}.${verb.toLowerCase()}.${prep.toLowerCase()}.${objectPascal}`)
+      // When preposition is "to", check if complement is an infinitive verb phrase
+      // e.g., "to fund operations" -> to.fund.Operations
+      if (parse.preposition === 'to') {
+        const complementWords = parse.complement.split(/\s+/).filter(w => w)
+        if (complementWords.length >= 2) {
+          const firstWord = complementWords[0].toLowerCase()
+          // Check if first word is a known verb (infinitive form)
+          // IMPORTANT: Words ending in -ing are NOT infinitives - they're gerunds used as nouns
+          // e.g., "to building design" -> "BuildingDesign" (not building.Design)
+          // Infinitives are base form: "to build", "to fund", "to address"
+          const isGerund = firstWord.endsWith('ing')
+          const verbsMap = this.lexicon?.verbs
+          // Only treat as verb if it's NOT a gerund and matches verb patterns
+          const isLikelyVerb = !isGerund && (
+            (verbsMap && verbsMap.has(firstWord)) ||
+            firstWord.endsWith('ize') || firstWord.endsWith('ate') ||
+            firstWord.endsWith('ify') || firstWord.endsWith('ect') ||
+            firstWord.endsWith('uce') || firstWord.endsWith('ase')
+          )
+          if (isLikelyVerb) {
+            // Infinitive: verb.Object
+            const verbPart = firstWord
+            const objectPart = this.toPascalCase(complementWords.slice(1).join(' '))
+            parts.push(`${verbPart}.${objectPart}`)
+          } else {
+            // Not a verb (or is a gerund), treat as noun phrase
+            parts.push(this.toPascalCase(parse.complement))
+          }
+        } else if (complementWords.length === 1) {
+          // Single word - could be a verb infinitive (to be, to do) or noun
+          const word = complementWords[0].toLowerCase()
+          // Gerunds are nouns, not infinitive verbs
+          const isGerund = word.endsWith('ing')
+          const verbsMap = this.lexicon?.verbs
+          if (!isGerund && verbsMap && verbsMap.has(word)) {
+            parts.push(word)
+          } else {
+            parts.push(this.toPascalCase(parse.complement))
+          }
+        }
       } else {
-        // Apply same hyphenated compound logic for complement
-        const words = parse.complement.split(/\s+/).filter(w =>
-          w && !['and', 'or', 'but'].includes(w.toLowerCase())
-        )
+        const verbsMap = this.lexicon?.verbs
 
-        // Check for preposition in complement (e.g., "requirements of customers")
-        const prepIndex = words.findIndex(w =>
-          ['of', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by'].includes(w.toLowerCase())
-        )
+        // Helper to check if a word is an infinitive verb (NOT a gerund)
+        // Gerunds (-ing) are nouns: "building design", "swimming pool"
+        // Infinitives are base form: "build", "fund", "address"
+        const isInfinitiveVerb = (word: string): boolean => {
+          const lower = word.toLowerCase()
+          // Gerunds are NOT infinitive verbs
+          if (lower.endsWith('ing')) return false
+          return (verbsMap && verbsMap.has(lower)) ||
+            lower.endsWith('ize') || lower.endsWith('ate') ||
+            lower.endsWith('ify') || lower.endsWith('ure') // ensure, secure
+        }
 
-        if (prepIndex > 0 && prepIndex < words.length - 1) {
-          // Split at preposition: "requirements of customers" -> "Requirements.of.Customers"
-          const beforePrep = words.slice(0, prepIndex)
-          const prep = words[prepIndex]
-          const afterPrep = words.slice(prepIndex + 1)
+        // Check if complement starts with "to + infinitive" (no noun before it)
+        // e.g., "to maximize returns" -> "maximize.Returns"
+        const startsWithToMatch = parse.complement.match(/^to\s+(\w+)\s+(.+)$/i)
+        if (startsWithToMatch) {
+          const [, potentialVerb, afterVerb] = startsWithToMatch
+          if (isInfinitiveVerb(potentialVerb)) {
+            // "to maximize returns" -> "maximize.Returns"
+            const verb = potentialVerb.toLowerCase()
+            const objectPascal = this.toPascalCase(afterVerb)
+            parts.push(`${verb}.${objectPascal}`)
+          } else {
+            parts.push(this.toPascalCase(parse.complement))
+          }
+        }
+        // Check for "to + infinitive" clause within the complement (with noun before)
+        // e.g., "organizations to maximize returns" should be split
+        else {
+          const toInfinitiveMatch = parse.complement.match(
+            /^(.+?)\s+to\s+(\w+)\s+(.+)$/i
+          )
 
-          const beforePascal = this.toPascalCase(beforePrep.join(' '))
-          const afterPascal = this.toPascalCase(afterPrep.join(' '))
+          if (toInfinitiveMatch) {
+            const [, beforeTo, potentialVerb, afterVerb] = toInfinitiveMatch
 
-          parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
-        } else {
-          // Convert to PascalCase using helper (strips commas and other punctuation)
-          parts.push(this.toPascalCase(parse.complement))
+            if (isInfinitiveVerb(potentialVerb)) {
+              // Split at "to" infinitive: "organizations to maximize returns" ->
+              // "Organizations.to.maximize.Returns"
+              const beforePascal = this.toPascalCase(beforeTo)
+              const verb = potentialVerb.toLowerCase()
+              const objectPascal = this.toPascalCase(afterVerb)
+              parts.push(`${beforePascal}.to.${verb}.${objectPascal}`)
+            } else {
+              // Not an infinitive, fall through to normal handling
+              parts.push(this.toPascalCase(parse.complement))
+            }
+          } else {
+            // Check if complement contains an internal prepositional phrase
+            // Pattern: "X <verb> <prep> Y" like "businesses concerned with production"
+            // Should become: Businesses.concerned.with.Production
+            const internalPrepMatch = parse.complement.match(
+              /^(.+?)\s+(concerned|related|involved|responsible|engaged|associated|dealing|focused|pertaining)\s+(with|to|in|for|on)\s+(.+)$/i
+            )
+
+            if (internalPrepMatch) {
+              const [, subject, verb, prep, object] = internalPrepMatch
+              // Format: Subject.verb.prep.Object
+              const subjectPascal = this.toPascalCase(subject)
+              const objectPascal = this.toPascalCase(object)
+              parts.push(`${subjectPascal}.${verb.toLowerCase()}.${prep.toLowerCase()}.${objectPascal}`)
+            } else {
+              // Apply same hyphenated compound logic for complement
+              const words = parse.complement.split(/\s+/).filter(w =>
+                w && !['and', 'or', 'but'].includes(w.toLowerCase())
+              )
+
+              // Check for preposition in complement (e.g., "requirements of customers")
+              const prepIndex = words.findIndex(w =>
+                ['of', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by'].includes(w.toLowerCase())
+              )
+
+              if (prepIndex > 0 && prepIndex < words.length - 1) {
+                // Split at preposition: "requirements of customers" -> "Requirements.of.Customers"
+                const beforePrep = words.slice(0, prepIndex)
+                const prep = words[prepIndex]
+                const afterPrep = words.slice(prepIndex + 1)
+
+                const beforePascal = this.toPascalCase(beforePrep.join(' '))
+                const afterPascal = this.toPascalCase(afterPrep.join(' '))
+
+                parts.push(`${beforePascal}.${prep.toLowerCase()}.${afterPascal}`)
+              } else {
+                // Convert to PascalCase using helper (strips commas and other punctuation)
+                parts.push(this.toPascalCase(parse.complement))
+              }
+            }
+          }
         }
       }
     }
